@@ -1,0 +1,247 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This version experiments with different number of layers and nodes.
+Saves different alpha value portfolio in a table.
+```{r echo=FALSE}
+library(h2o)
+library(dplyr)
+library(rbokeh)
+library(purrr)
+library(tidyr)
+library(magrittr)
+library(e1071)
+library(ggplot2)
+```
+
+This function creates takes our input data frame and creates a data frame with the requisite lookback period L. It also creates the binomial dist column. A 1 indicates the index went up, 0 indicates it went down or stayed constant.
+
+```{r echo=FALSE}
+df=mer_df_percentile
+df$Sign = pmax(sign(df$SPX),0)
+print(names(df))
+m = dim(df)[1]   #no of rows to mod
+l = 30  #lookback no of days
+df2 = df[(l+1):m,c(1,2,22)]
+for (j in 1:l) {
+  df2 = cbind(df2,df[j:(m-l+j-1),3:21])
+}
+dim(df2)
+
+names(df2)[4:ncol(df2)]=paste("percentile_",seq(1:(ncol(df2)-3)), sep="")
+df2$Sign=as.factor(df2$Sign)
+
+```
+
+This function trains our neural network.
+
+```{r echo=FALSE}
+localH2O = h2o.init(ip="localhost", port = 54321, nthreads=3, max_mem_size="5G", startH2O = TRUE)
+train_nn=function(train,test){
+  
+  train <- as.h2o(train[,3:ncol(train)], destination_frame="train")
+  test <- as.h2o(test[,3:ncol(test)], destination_frame="test")
+  
+  y="Sign"
+  x=setdiff(names(train),y)
+  model <- h2o.deeplearning(x = x,
+                            y = y,
+                            training_frame = train,
+                            validation_frame = test,
+                            distribution = "multinomial",
+                            activation = "RectifierWithDropout",
+                            hidden = c(200,200,200),
+                            input_dropout_ratio = 0.2,
+                            l1 = 1e-5,
+                            seed = 10,
+                            epochs = 50)
+
+return(model)
+}
+```
+
+This function tests our neural network. It needs a trained model from the train function above and tests it on previously unseen data:
+```{r echo=FALSE}
+test_nn=function(test,model){
+ 
+  test <- as.h2o(test[,3:ncol(test)], destination_frame="test")
+  y="Sign"
+  x=setdiff(names(test),y)
+  predictions=h2o.predict(model,test)
+  #Predictions are in this case if we get 1 or 0, accuracy is if we got it right.
+  temp=as.data.frame(predictions)
+  predictions=temp$predict
+  accuracy=ifelse(predictions==as.vector(test['Sign']),1,0)
+  accuracy=sum(accuracy==1)/length(accuracy)
+  return(list(accuracy,predictions))
+}
+```
+
+The below code is the setup for the prediction.
+
+
+```{r echo=FALSE}
+accuracy=list()
+plots=list()
+model=list()
+n=5000 # number of entries for training the model on, for rolling window.
+l=30 #lookback period to create 19*l columns for predictor variables.
+f=20 # forecast days ahead for rolling window.
+rsample=1000 #no of days of random sample
+i=1
+rounds=round((nrow(df2)-n)/f)-2
+for (i in 1:rounds)
+{
+  if(i==1){
+    train=df2[1:n,]
+    test=train[sample(nrow(train),rsample),]
+  }
+  else{
+    train=df2[((f*i)+1):(n+(f*i)-1),]
+    test=train[sample(nrow(train),rsample),]
+  }
+  
+  model=train_nn(train,test)
+  accuracy[[i]]= test_nn(test, model)
+  i=i+1
+  gc()
+}
+
+```
+
+Creating a confusion matrix of all true positives, and negatives.
+```{r}
+predicted=unlist(map(accuracy,2))
+predicted=predicted[!is.na(predicted)]
+actual=tail(df2$Sign,length(predicted))
+
+predicted=as.numeric(as.character(predicted))
+actual=as.numeric(as.character(actual))
+
+confmat=table(predicted,actual)
+names(dimnames(confmat))=c("Predicted", "Actual")
+oa=sum(diag(confmat))/sum(confmat)
+
+```
+
+Creating a plot of the data
+```{r, echo=FALSE}
+pred=unlist(map(accuracy,1))
+pred=pred[!is.na(pred)]
+fpaa=sum(pred>0.5)/length(pred)
+qplot(pred,bins=50)
+plot=figure()%>%ly_points(pred)%>%x_axis("Forecast days sample 1000, Total runs 375")%>% y_axis("Accuracy, FPAA 88.8%")
+```
+
+Sample Portfolio Modelling: In this section we start with a 100$ investment in the S&P 500 Index on 05-20-1977 (the first date our model starts to predict) and compare the hypothetical return on the S&P 500 if the investment was based on our model, versus the baseline model, where we assume the index was already up. It is to be noted that in the baseline model the index was actually up 54% of the time over the years.
+
+First case: Always assuming index is going up and using buy and hold strategy.
+
+Second Case trading on our model. Here we start with an initial investment of 100$ on 05-20-1977. From here when our model predicts that the market will go down, we go all cash and invest the entire cash on hand if we predict the market will go up.
+This covers buy and hold and bang bang model
+
+```{r}
+#Case 1:
+invest_naive=100
+df2$date[tail(length(predicted))]
+portfolio_naive=list()
+
+returns=as.vector(tail(df2$SPX,length(predicted)))
+for (i in 1:length(returns))
+{
+  invest_naive=invest_naive+(invest_naive*returns[i])
+  portfolio_naive[i]=invest_naive
+  i=i+1
+}
+
+#Case 2:
+portfolio_model=list()
+invest_model=100
+for (i in 1:length(returns)){
+  if(predicted[i]==1){
+    invest_model=invest_model+(invest_model*returns[i])
+  }
+  portfolio_model[i]=invest_model
+  i=i+1
+}
+
+plot_model=figure()%>%ly_lines(unlist(portfolio_naive), color="blue")%>%ly_lines(unlist(portfolio_model), color="green")%>%x_axis("Forecast days ahead")%>%y_axis("Returns: Buy and hold:Blue, Strategy with alpha(0): Green ")
+
+gain_on_model=(invest_model-invest_naive)/invest_naive
+```
+
+Using Professor's trading strategy outlined in the paper.
+
+Calculating metrics for table
+
+Function takes an investment and alpha value and returns an array of results.
+```{r}
+portfolio_modeler=function(invest_strat=100,alpha)
+{
+  
+portfolio_strat=list()
+rf=read.csv("RF-Treasure.csv")
+rf$date=as.Date.character(rf$date, "%Y%m%d")
+mer_df_percentile=merge(mer_df_percentile,rf, by="date")
+
+rf=tail(mer_df_percentile$rf,length(predicted))
+
+#x=ifelse(sign(df$SPX)==1,1, ifelse(sign(df$SPX)==-1,-1,0))
+x=ifelse((predicted==1),1,-1)
+x=tail(x,length(predicted))
+
+#P(t+1)=P(t)[1+(1+x)Rs(t+1)-xRf(t+1) 
+invest_strat=100
+for (i in 1:length(returns)){
+invest_strat=invest_strat*(1+(1+(x[i]*alpha))*returns[i]-(x[i]*alpha)*rf[i])
+portfolio_strat[i]=invest_strat
+i=i+1
+}
+
+
+plot_strat=figure()%>%ly_lines(unlist(portfolio_naive), color="blue")%>%ly_lines(unlist(portfolio_strat), color="green")%>%x_axis("Forecast days ahead")%>%y_axis("Returns: Buy and hold:Blue, Strategy with alpha(0.3): Green ")
+
+gain_on_strat=(invest_strat-invest_naive)/invest_naive
+
+#Calculating metrics for table.
+
+#met_model=unlist(portfolio_model)
+#met_model_gain=log(lead(met_model)/met_model)
+#met_model_gain=met_model_gain[!is.na(met_model_gain)]
+
+met_naive=unlist(portfolio_naive)
+met_naive_gain=log(lead(met_naive)/met_naive)
+met_naive_gain=met_naive_gain[!is.na(met_naive_gain)]
+
+met_strat=unlist(portfolio_strat)
+met_strat_gain=log(lead(met_strat)/met_strat)
+met_strat_gain=met_strat_gain[!is.na(met_strat_gain)]
+
+temp=summary(met_strat_gain)
+port_mean=temp[4]
+port_median=temp[3]
+
+port_sd=sd(met_strat_gain)
+
+port_kurtosis=kurtosis(met_strat_gain)
+port_skewness=skewness(met_strat_gain)
+lm(met_strat_gain~met_naive_gain)
+
+port_te=sd(met_strat_gain-met_naive_gain)
+port_ir=(mean(met_strat_gain)-mean(met_naive_gain))/port_te
+
+port_reg=summary(lm(met_strat_gain~met_naive_gain))
+
+return (list(port_mean,port_median,port_sd,port_kurtosis,port_skewness,port_te,port_ir,port_reg$coefficients))
+}
+```
+```{r}
+alpha=array(c(0,0.1,0.2,0.3,0.5))
+p=sapply(alpha, portfolio_modeler)
+```
+
+
+
+
